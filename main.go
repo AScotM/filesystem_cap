@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 type Config struct {
@@ -63,9 +64,9 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
 		cancel()
 	}()
@@ -114,7 +115,7 @@ func readMounts() ([][]string, error) {
 
 func shouldIncludeFS(fsType string, excludeTypes []string) bool {
 	for _, ex := range excludeTypes {
-		if ex != "" && fsType == ex {
+		if ex != "" && (fsType == ex || strings.HasPrefix(fsType, ex)) {
 			return false
 		}
 	}
@@ -133,6 +134,7 @@ func filterMounts(mounts [][]string, excludeTypes []string) [][]string {
 
 func analyze(mounts [][]string, logger *log.Logger, ctx context.Context) []FS {
 	var list []FS
+	lastLog := time.Now()
 
 	for i, m := range mounts {
 		select {
@@ -142,8 +144,9 @@ func analyze(mounts [][]string, logger *log.Logger, ctx context.Context) []FS {
 		default:
 		}
 
-		if i%10 == 0 {
+		if time.Since(lastLog) > 2*time.Second {
 			logger.Printf("Processing %d/%d mounts...", i, len(mounts))
+			lastLog = time.Now()
 		}
 
 		var s syscall.Statfs_t
@@ -152,8 +155,8 @@ func analyze(mounts [][]string, logger *log.Logger, ctx context.Context) []FS {
 			continue
 		}
 
-		total := s.Blocks * uint64(s.Bsize)
-		free := s.Bavail * uint64(s.Bsize)
+		total := uint64(s.Blocks) * uint64(s.Bsize)
+		free := uint64(s.Bavail) * uint64(s.Bsize)
 		used := total - free
 		usage := 0.0
 		if total > 0 {
@@ -178,13 +181,14 @@ func fmtBytes(b uint64, humanReadable bool) string {
 		return fmt.Sprintf("%d", b)
 	}
 
+	units := []string{"B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"}
+	
 	if b < 1024 {
 		return fmt.Sprintf("%d B", b)
 	}
 
-	units := []string{"B", "KiB", "MiB", "GiB", "TiB", "PiB"}
 	exp := math.Log(float64(b)) / math.Log(1024)
-	idx := int(exp)
+	idx := int(math.Floor(exp))
 	if idx >= len(units) {
 		idx = len(units) - 1
 	}
@@ -202,7 +206,7 @@ func (c ColorScheme) ForUsage(usage, warn, crit float64, noColor bool) string {
 		return c.Critical
 	case usage >= warn:
 		return c.High
-	case usage >= 70:
+	case usage >= 50:
 		return c.Medium
 	default:
 		return c.Low
@@ -211,7 +215,7 @@ func (c ColorScheme) ForUsage(usage, warn, crit float64, noColor bool) string {
 
 func sortFS(list []FS, by string) {
 	sort.Slice(list, func(i, j int) bool {
-		switch by {
+		switch strings.ToLower(by) {
 		case "mount":
 			return list[i].Mount < list[j].Mount
 		case "usage":
@@ -246,8 +250,11 @@ func displayJSON(list []FS) {
 func displayCSV(list []FS) {
 	fmt.Println("Device,Mount,Type,Total,Used,Free,Usage")
 	for _, d := range list {
+		device := strings.ReplaceAll(d.Device, ",", "_")
+		mount := strings.ReplaceAll(d.Mount, ",", "_")
+		fsType := strings.ReplaceAll(d.Type, ",", "_")
 		fmt.Printf("%s,%s,%s,%d,%d,%d,%.2f\n",
-			d.Device, d.Mount, d.Type, d.Total, d.Used, d.Free, d.Usage)
+			device, mount, fsType, d.Total, d.Used, d.Free, d.Usage)
 	}
 }
 
